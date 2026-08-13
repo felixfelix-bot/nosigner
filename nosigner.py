@@ -108,6 +108,26 @@ def _compute_shared_point(privkey: bytes, pubkey_xonly: bytes) -> bytes:
         return our_sk.ecdh(bytes([0x03]) + pubkey_xonly)
 
 
+def _compute_shared_secret(privkey: bytes, pubkey_xonly: bytes) -> bytes:
+    """Return the *canonical* ECDH shared secret independent of parity.
+
+    coincurve's ecdh() returns sha256(compressed_remote_pubkey) to prevent
+    malleability, so using 0x02 vs 0x03 prefixes yields different results when
+    the two sides happen to use opposite parities. To keep both sides in sync
+    we compute both possibilities and return the lexicographically smaller one.
+    """
+    our_sk = coincurve.PrivateKey(privkey)
+    candidates = []
+    for prefix in (0x02, 0x03):
+        try:
+            candidates.append(our_sk.ecdh(bytes([prefix]) + pubkey_xonly))
+        except Exception:
+            continue
+    if not candidates:
+        raise ValueError("The public key could not be parsed or is invalid.")
+    return min(candidates)
+
+
 def _nip44_conversation_key(shared_point: bytes) -> bytes:
     """NIP-44 v2 conversation key = HKDF(shared_point, salt='nip44-v2', info='nip44-conversation-key')."""
     return _hkdf_derive(
@@ -120,12 +140,12 @@ def _nip44_conversation_key(shared_point: bytes) -> bytes:
 
 def get_nip04_key(privkey: bytes, pubkey_xonly: bytes) -> bytes:
     """NIP-04 AES key is the raw ECDH shared point (32 bytes)."""
-    return _compute_shared_point(privkey, pubkey_xonly)
+    return _compute_shared_secret(privkey, pubkey_xonly)
 
 
 def get_conversation_key(privkey: bytes, pubkey_xonly: bytes) -> bytes:
     """Derive NIP-44 conversation key from private key and remote public key."""
-    shared_point = _compute_shared_point(privkey, pubkey_xonly)
+    shared_point = _compute_shared_secret(privkey, pubkey_xonly)
     return _nip44_conversation_key(shared_point)
 
 
@@ -667,6 +687,8 @@ class Nip46Handler:
                 decrypted = nip04_decrypt(raw_content, self.privkey, client_pk_bytes)
                 content = json.loads(decrypted)
                 self._client_schemes[client_pubkey_hex] = "nip04"
+                # Ensure a conversation key exists so response encryption can use it.
+                self.get_conversation_key_for(client_pubkey_hex)
                 logger.debug(f"Decrypted NIP-04 request from {client_pubkey_hex[:16]}...: method={content[1] if len(content) > 1 else '?'}")
                 return content
             except Exception as e:
@@ -683,6 +705,8 @@ class Nip46Handler:
                 conv_key = self.get_conversation_key_for(client_pubkey_hex)
                 decrypted = nip44_decrypt(raw_content, conv_key)
                 content = json.loads(decrypted)
+                self._client_schemes[client_pubkey_hex] = "nip44"
+                # Mark the client as NIP-44 capable for response encryption.
                 self._client_schemes[client_pubkey_hex] = "nip44"
                 logger.debug(f"Decrypted NIP-44 request from {client_pubkey_hex[:16]}...: method={content[1] if len(content) > 1 else '?'}")
                 return content

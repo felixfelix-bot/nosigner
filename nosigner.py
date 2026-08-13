@@ -11,7 +11,7 @@ Usage:
     python3 nosigner.py --bunker-url <bunker://url> [--one-shot]
 
 Protocol: NIP-46 (Remote Signer)
-Encryption: NIP-44
+Encryption: NIP-44 (with NIP-04 fallback for nak bunker clients)
 Events: kind 24133 (connect request/response)
 """
 
@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hmac as hmac_mod
 import json
 import logging
 import os
@@ -31,8 +33,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 import coincurve
+import hashlib
 import websockets.asyncio.client as ws_client
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF, HKDFExpand
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -66,17 +71,11 @@ def setup_logging(verbose: bool = False) -> None:
     logger.addHandler(fh)
 
 
-# ── Crypto / NIP-44 ────────────────────────────────────────────────────────
-
-# NIP-44 uses AES-256-GCM with a specific key derivation
-# See https://github.com/nostr-protocol/nips/blob/master/44.md
+# ── Crypto / NIP-04 / NIP-44 ───────────────────────────────────────────────
 
 
 def _hkdf_derive(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
     """HMAC-based Extract-and-Expand Key Derivation (NIP-44 spec)."""
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=length,
@@ -86,16 +85,96 @@ def _hkdf_derive(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
     return hkdf.derive(ikm)
 
 
+def _compute_shared_point(privkey: bytes, pubkey_xonly: bytes) -> bytes:
+    """ECDH shared point (32-byte x-coordinate) for NIP-04 / NIP-44.
+
+    coincurve's ecdh() accepts a 33-byte compressed pubkey. Nostr public keys
+    are 32-byte x-only values, so we must reconstruct the compressed form. The
+    real compressed pubkey may use prefix 0x02 or 0x03 depending on y-parity.
+    Using the wrong prefix produces a different (but valid) shared point.
+
+    NIP-04 implementations encrypt with the *actual* compressed pubkey. Since
+    x-only loses parity, we compute the shared point for both parities and return
+    the canonical one: the shared x-coordinate is the same regardless of the
+    remote pubkey's parity (both points share the same x). The signer's parity
+    does not affect ECDH. Therefore either valid parity yields the correct
+    shared secret. We return the 0x02 result for consistency with most
+    implementations.
+    """
+    our_sk = coincurve.PrivateKey(privkey)
+    try:
+        return our_sk.ecdh(bytes([0x02]) + pubkey_xonly)
+    except Exception:
+        return our_sk.ecdh(bytes([0x03]) + pubkey_xonly)
+
+
+def _nip44_conversation_key(shared_point: bytes) -> bytes:
+    """NIP-44 v2 conversation key = HKDF(shared_point, salt='nip44-v2', info='nip44-conversation-key')."""
+    return _hkdf_derive(
+        ikm=shared_point,
+        salt=b"nip44-v2",
+        info=b"nip44-conversation-key",
+        length=32,
+    )
+
+
+def get_nip04_key(privkey: bytes, pubkey_xonly: bytes) -> bytes:
+    """NIP-04 AES key is the raw ECDH shared point (32 bytes)."""
+    return _compute_shared_point(privkey, pubkey_xonly)
+
+
+def get_conversation_key(privkey: bytes, pubkey_xonly: bytes) -> bytes:
+    """Derive NIP-44 conversation key from private key and remote public key."""
+    shared_point = _compute_shared_point(privkey, pubkey_xonly)
+    return _nip44_conversation_key(shared_point)
+
+
+def nip04_encrypt(plaintext: str, privkey: bytes, pubkey_xonly: bytes) -> str:
+    """NIP-04 encrypt: returns 'base64(ct)?base64(iv)'.
+
+    Uses AES-256-CBC with the raw ECDH shared point as key and a random 16-byte IV.
+    """
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    key = get_nip04_key(privkey, pubkey_xonly)
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    pt = plaintext.encode("utf-8")
+    # PKCS#7 padding
+    pad_len = 16 - (len(pt) % 16)
+    if pad_len == 0:
+        pad_len = 16
+    pt_padded = pt + bytes([pad_len]) * pad_len
+    ct = encryptor.update(pt_padded) + encryptor.finalize()
+    return base64.b64encode(ct).decode() + "?" + base64.b64encode(iv).decode()
+
+
+def nip04_decrypt(ciphertext: str, privkey: bytes, pubkey_xonly: bytes) -> str:
+    """NIP-04 decrypt: parses 'base64(ct)?base64(iv)'.
+
+    Uses AES-256-CBC with the raw ECDH shared point as key.
+    """
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    if "?" not in ciphertext:
+        raise ValueError("Invalid NIP-04 ciphertext: missing '?' separator")
+    ct_b64, iv_b64 = ciphertext.split("?", 1)
+    ct = base64.b64decode(ct_b64)
+    iv = base64.b64decode(iv_b64)
+    key = get_nip04_key(privkey, pubkey_xonly)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    pt_padded = decryptor.update(ct) + decryptor.finalize()
+    # PKCS#7 unpadding
+    pad_len = pt_padded[-1]
+    if pad_len > 16 or pad_len == 0 or pt_padded[-pad_len:] != bytes([pad_len]) * pad_len:
+        raise ValueError("Invalid PKCS#7 padding")
+    return pt_padded[:-pad_len].decode("utf-8")
+
+
 def nip44_encrypt(plaintext: str, conversation_key: bytes) -> str:
     """NIP-44 v2 encrypt. Returns base64 payload."""
-    import base64
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
-    from cryptography.hazmat.primitives import hashes
-    import hmac as hmac_mod
-    import hashlib
-
-    # NIP-44 v2: derive per-message key
     # 1. HKDF-Expand(PRK=conversation_key, info="nip44-v2", L=32)
     hkdf_expand = HKDFExpand(
         algorithm=hashes.SHA256(),
@@ -123,13 +202,6 @@ def nip44_encrypt(plaintext: str, conversation_key: bytes) -> str:
 
 def nip44_decrypt(ciphertext_b64: str, conversation_key: bytes) -> str:
     """NIP-44 v2 decrypt. Returns plaintext string."""
-    import base64
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
-    from cryptography.hazmat.primitives import hashes
-    import hmac as hmac_mod
-    import hashlib
-
     payload = base64.b64decode(ciphertext_b64)
 
     # Parse NIP-44 v2 payload: version(1) + nonce(32) + ciphertext+mac(rest)
@@ -159,27 +231,6 @@ def nip44_decrypt(ciphertext_b64: str, conversation_key: bytes) -> str:
     cipher = ChaCha20Poly1305(enc_key)
     pt = cipher.decrypt(b"\x00" * 12, ct_with_mac, None)
     return pt.decode("utf-8")
-
-
-def get_conversation_key(privkey: bytes, pubkey_xonly: bytes) -> bytes:
-    """Derive NIP-44 conversation key from private key and remote public key.
-
-    Uses ECDH then HKDF as specified in NIP-44.
-    The pubkey_xonly is the 32-byte x-only public key (Nostr format).
-    For ECDH we need the compressed 33-byte format - we use 02 prefix
-    (even y) since ECDH with x-only is valid for both y parities on the curve.
-    """
-    # ECDH: reconstruct compressed pubkey (02 prefix for the x coordinate)
-    compressed_pubkey = bytes([0x02]) + pubkey_xonly
-    our_sk = coincurve.PrivateKey(privkey)
-    shared_point = our_sk.ecdh(compressed_pubkey)
-    # HKDF derivation
-    return _hkdf_derive(
-        ikm=shared_point,
-        salt=b"nip44-v2",
-        info=b"nip44-conversation-key",
-        length=32,
-    )
 
 
 # ── Key utilities ──────────────────────────────────────────────────────────
@@ -264,15 +315,11 @@ def sign_event(privkey: bytes, event_hash: bytes) -> str:
 
 
 def hashlib_sha256(msg: bytes) -> bytes:
-    import hashlib
-
     return hashlib.sha256(msg).digest()
 
 
 def compute_event_id(pubkey: str, created_at: int, kind: int, tags: list, content: str) -> bytes:
     """Compute the NIP-01 event id (SHA256 of serialized event)."""
-    import hashlib
-
     serialized = json.dumps([0, pubkey, created_at, kind, tags, content], separators=(",", ":"))
     return hashlib.sha256(serialized.encode()).digest()
 
@@ -498,6 +545,7 @@ class RelayPool:
             filt["authors"] = authors
         if p_tags is not None:
             filt["#p"] = p_tags
+
         sub = json.dumps(["REQ", sub_id, filt])
         logger.debug(f"Subscribing with filter: {filt}")
         for q in self._queues.values():
@@ -591,13 +639,14 @@ class Nip46Handler:
         self.state = state
         self._pending_pings: dict[str, float] = {}
         self._conversation_keys: dict[str, bytes] = {}  # client_pubkey -> conv_key
+        self._client_schemes: dict[str, str] = {}  # client_pubkey -> 'nip04'/'nip44'
         self._active_secret: str | None = None
 
     def set_active_secret(self, secret: str) -> None:
         self._active_secret = secret
 
     def get_conversation_key_for(self, client_pubkey_hex: str) -> bytes:
-        """Get or derive the conversation key for a client."""
+        """Get or derive the NIP-44 conversation key for a client."""
         if client_pubkey_hex not in self._conversation_keys:
             client_pk_bytes = bytes.fromhex(client_pubkey_hex)
             self._conversation_keys[client_pubkey_hex] = get_conversation_key(
@@ -605,12 +654,50 @@ class Nip46Handler:
             )
         return self._conversation_keys[client_pubkey_hex]
 
+    def _decrypt_request(self, raw_content: str, client_pubkey_hex: str) -> Any:
+        """Try NIP-04 first (nak uses it for NIP-46), then fall back to NIP-44.
+
+        Returns parsed JSON content.
+        """
+        client_pk_bytes = bytes.fromhex(client_pubkey_hex)
+
+        # NIP-04: base64(ct)?base64(iv)
+        if "?" in raw_content and not raw_content.strip().startswith("["):
+            try:
+                decrypted = nip04_decrypt(raw_content, self.privkey, client_pk_bytes)
+                content = json.loads(decrypted)
+                self._client_schemes[client_pubkey_hex] = "nip04"
+                logger.debug(f"Decrypted NIP-04 request from {client_pubkey_hex[:16]}...: method={content[1] if len(content) > 1 else '?'}")
+                return content
+            except Exception as e:
+                logger.debug(f"NIP-04 decrypt failed, will try NIP-44: {e}")
+                # fall through to NIP-44
+
+        # NIP-44 v2: first byte after base64 decode is 0x02
+        try:
+            decoded = base64.b64decode(raw_content)
+        except Exception:
+            decoded = b""
+        if decoded and decoded[0] == 0x02:
+            try:
+                conv_key = self.get_conversation_key_for(client_pubkey_hex)
+                decrypted = nip44_decrypt(raw_content, conv_key)
+                content = json.loads(decrypted)
+                self._client_schemes[client_pubkey_hex] = "nip44"
+                logger.debug(f"Decrypted NIP-44 request from {client_pubkey_hex[:16]}...: method={content[1] if len(content) > 1 else '?'}")
+                return content
+            except Exception as e:
+                logger.warning(f"NIP-44 decrypt failed: {e}")
+                raise
+
+        raise ValueError(f"Unsupported encryption format")
+
     async def handle_request(self, event: dict[str, Any]) -> dict[str, Any] | None:
         """Handle an incoming NIP-46 request event. Returns response event or None."""
         raw_content = event.get("content", "")
         client_pubkey = event.get("pubkey", "")
 
-        # NIP-46 requests are NIP-44 encrypted. Try to decrypt first.
+        # NIP-46 requests are NIP-04/NIP-44 encrypted. Try to decrypt first.
         content = None
         if raw_content.startswith("["):
             # Unencrypted (rare, some test clients)
@@ -620,11 +707,9 @@ class Nip46Handler:
                 logger.warning(f"Invalid unencrypted content: {raw_content[:100]}")
                 return None
         else:
-            # Encrypted — decrypt with NIP-44
+            # Encrypted — decrypt with NIP-04 first (nak), then NIP-44
             try:
-                conv_key = self.get_conversation_key_for(client_pubkey)
-                decrypted = nip44_decrypt(raw_content, conv_key)
-                content = json.loads(decrypted)
+                content = self._decrypt_request(raw_content, client_pubkey)
                 logger.debug(f"Decrypted request from {client_pubkey[:16]}...: method={content[1] if len(content) > 1 else '?'}")
             except Exception as e:
                 logger.warning(f"Failed to decrypt request from {client_pubkey[:16]}...: {e}")
@@ -673,19 +758,26 @@ class Nip46Handler:
             logger.error(f"Error handling {method}: {e}")
             return self._make_response(req_id, "error", str(e), client_pubkey)
 
+    def handle_request_sync(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        """Synchronous wrapper for handle_request, useful for tests."""
+        import asyncio
+        return asyncio.run(self.handle_request(event))
+
     def _make_response(
         self, req_id: str, result_type: str, result: Any, client_pubkey: str
     ) -> dict[str, Any]:
         """Create a NIP-46 response event."""
         response_content = json.dumps([req_id, result_type, result])
-        # Encrypt the response with NIP-44
+        # Encrypt the response with the same scheme the client used, if known.
+        # We default to NIP-44 when a conversation key exists; nak clients that
+        # sent NIP-04 will be handled via _encrypt_response which inspects the
+        # last request format. For simplicity, we encrypt with NIP-44 if we have
+        # a key, since nak also supports NIP-44. However to maintain backward
+        # compatibility with strict NIP-04 clients, encrypt with NIP-04 when the
+        # client explicitly used NIP-04 for its request.
+        content = response_content
         if client_pubkey and client_pubkey in self._conversation_keys:
-            conv_key = self._conversation_keys[client_pubkey]
-            encrypted = nip44_encrypt(response_content, conv_key)
-            content = encrypted
-        else:
-            content = response_content
-
+            content = self._encrypt_response(response_content, client_pubkey)
         return make_event(
             privkey=self.privkey,
             kind=NIP_46_KIND,
@@ -693,7 +785,26 @@ class Nip46Handler:
             tags=[["p", client_pubkey]] if client_pubkey else [],
         )
 
+    def _encrypt_response(self, plaintext: str, client_pubkey: str) -> str:
+        """Encrypt a response, preferring NIP-04 if that is what the client used."""
+        conv_key = self._conversation_keys.get(client_pubkey)
+        scheme = self._client_schemes.get(client_pubkey, "nip44")
+        if scheme == "nip04" or conv_key is None:
+            client_pk_bytes = bytes.fromhex(client_pubkey)
+            return nip04_encrypt(plaintext, self.privkey, client_pk_bytes)
+        return nip44_encrypt(plaintext, conv_key)
+
+    def get_conversation_key_for(self, client_pubkey_hex: str) -> bytes:
+        """Get or derive the NIP-44 conversation key for a client."""
+        if client_pubkey_hex not in self._conversation_keys:
+            client_pk_bytes = bytes.fromhex(client_pubkey_hex)
+            self._conversation_keys[client_pubkey_hex] = get_conversation_key(
+                self.privkey, client_pk_bytes
+            )
+        return self._conversation_keys[client_pubkey_hex]
+
     # ── Method handlers ────────────────────────────────────────────────
+
 
     async def _handle_connect(
         self, req_id: str, params: list, client_pubkey: str
@@ -703,7 +814,6 @@ class Nip46Handler:
             return self._make_response(req_id, "error", "Missing params", client_pubkey)
 
         secret = params[0] if len(params) > 0 else ""
-        # Also check the event content for the secret (some clients embed it)
         # Verify secret
         if self._active_secret and secret != self._active_secret:
             logger.warning(f"Connect failed: bad secret from {client_pubkey[:16]}...")
@@ -757,13 +867,31 @@ class Nip46Handler:
         self, req_id: str, params: list, client_pubkey: str
     ) -> dict[str, Any]:
         """Handle 'nip04_encrypt'."""
-        return self._make_response(req_id, "error", "NIP-04 not implemented, use NIP-44", client_pubkey)
+        if len(params) < 2:
+            return self._make_response(req_id, "error", "Need plaintext and pubkey", client_pubkey)
+        plaintext = params[0]
+        target_pubkey_hex = params[1]
+        try:
+            target_pk = bytes.fromhex(target_pubkey_hex)
+            encrypted = nip04_encrypt(plaintext, self.privkey, target_pk)
+            return self._make_response(req_id, "ok", encrypted, client_pubkey)
+        except Exception as e:
+            return self._make_response(req_id, "error", str(e), client_pubkey)
 
     async def _handle_nip04_decrypt(
         self, req_id: str, params: list, client_pubkey: str
     ) -> dict[str, Any]:
         """Handle 'nip04_decrypt'."""
-        return self._make_response(req_id, "error", "NIP-04 not implemented, use NIP-44", client_pubkey)
+        if len(params) < 2:
+            return self._make_response(req_id, "error", "Need ciphertext and pubkey", client_pubkey)
+        ciphertext = params[0]
+        sender_pubkey_hex = params[1]
+        try:
+            sender_pk = bytes.fromhex(sender_pubkey_hex)
+            decrypted = nip04_decrypt(ciphertext, self.privkey, sender_pk)
+            return self._make_response(req_id, "ok", decrypted, client_pubkey)
+        except Exception as e:
+            return self._make_response(req_id, "error", str(e), client_pubkey)
 
     async def _handle_nip44_encrypt(
         self, req_id: str, params: list, client_pubkey: str
@@ -838,7 +966,7 @@ class BunkerDaemon:
         await self.pool.start()
         self._sub_id = await self.pool.subscribe(
             kinds=[NIP_46_KIND],
-            # Receive all kind 24133 events, filter by p-tag in handler
+            p_tags=[self.pubkey_hex],
         )
         logger.info("Listening for NIP-46 requests...")
 
